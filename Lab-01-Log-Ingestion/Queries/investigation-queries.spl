@@ -1,0 +1,16 @@
+#confirming logs being ingested
+
+index=*
+| stats count by index host
+
+
+#Searching for the activity in Splunk using the following SPL (Opened the Calculator and Notepad)
+
+index=sysmon (process_exec=notepad.exe OR calc.exe) | table  _time EventID EventDescription host process_name
+
+
+#Confirming the test message arrived in the logs in Splunk
+
+index=main "CySA+ lab test"
+
+

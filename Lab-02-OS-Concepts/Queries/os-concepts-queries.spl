@@ -1,0 +1,5 @@
+index=sysmon (EventCode=13 OR EventCode=12 OR EventCode=14)
+| where like(TargetObject, "%\\Software\\Microsoft\\Windows\\CurrentVersion\\Run%")
+| table _time Computer User EventCode TargetObject Details
+| sort 0 -_time
+

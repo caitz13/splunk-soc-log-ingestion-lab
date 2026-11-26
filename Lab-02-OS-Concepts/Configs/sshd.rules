@@ -1,0 +1,5 @@
+sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sudo systemctl restart ssh
+# (Generates audit records with key "sshd_config_change")
+
