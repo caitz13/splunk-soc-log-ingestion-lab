@@ -1,0 +1,234 @@
+# Lab 1 – SIEM Log Ingestion with Splunk Enterprise
+
+## Overview
+
+This lab demonstrates how to centralise Windows and Linux logs in Splunk Enterprise so endpoint activity can be searched and investigated from one location.
+
+The Windows endpoint uses Splunk Universal Forwarder to send Windows Event Logs and Sysmon Operational events to Splunk over TCP port `9997`. The Ubuntu endpoint forwards syslog messages to a Splunk UDP input on port `1514` using rsyslog.
+
+The lab focuses on establishing log collection, checking that data reaches the expected Splunk indexes and using Splunk Processing Language (SPL) to investigate generated activity.
+
+## Lab environment
+
+| Component | Technology / configuration |
+| --- | --- |
+| SIEM | Splunk Enterprise |
+| Virtualisation | Oracle VirtualBox |
+| Windows endpoint | Windows 11 |
+| Linux endpoint | Ubuntu |
+| Windows log collector | Splunk Universal Forwarder |
+| Windows endpoint telemetry | Windows Event Logs and Sysmon |
+| Linux log forwarding | rsyslog |
+| Windows forwarding | TCP `9997` |
+| Linux forwarding | UDP `1514` |
+| Search language | Splunk SPL |
+
+## Architecture
+
+```text
+Windows 11
+  ├── Application / Security / System / Firewall logs
+  └── Sysmon Operational events
+            |
+   Splunk Universal Forwarder
+            |
+       TCP 9997
+            |
+            v
+       Splunk Enterprise
+       ├── wineventlog index
+       └── sysmon index
+
+Ubuntu
+  └── rsyslog
+        |
+      UDP 1514
+        |
+        v
+   Splunk Enterprise
+        └── main index
+```
+
+The Linux forwarding configuration used in the lab sends syslog messages to `127.0.0.1:1514`, which assumes Splunk's UDP input is reachable on the Ubuntu host, for example through Docker port publishing. Adjust the destination if Splunk is hosted elsewhere.
+
+## Repository contents
+
+| Path | Purpose |
+| --- | --- |
+| `Configs/inputs.conf` | Selects Windows event channels and assigns the `wineventlog` and `sysmon` indexes |
+| `Configs/outputs.conf` | Configures the Universal Forwarder destination on TCP port 9997 |
+| `Scripts/UF.ps1` | Writes the forwarder input/output configuration and restarts the forwarder service |
+| `Queries/investigation-queries.spl` | Contains searches used to confirm ingestion and investigate the lab test activity |
+| `Screenshots/` | Evidence of the Splunk UDP input, Linux log ingestion and Windows/Sysmon searches |
+
+## 1. Windows log forwarding
+
+### 1.1 Configure the receiver
+
+In Splunk Enterprise, enable a receiving port for Universal Forwarders on TCP `9997`. The Windows Universal Forwarder must be able to reach the Splunk server on that port.
+
+Test connectivity from Windows with:
+
+```powershell
+Test-NetConnection -ComputerName <SPLUNK_SERVER_IP> -Port 9997
+```
+
+A successful TCP test should show `TcpTestSucceeded : True`.
+
+### 1.2 Configure the Universal Forwarder
+
+The supplied `Configs/outputs.conf` defines the destination:
+
+```ini
+[tcpout]
+defaultGroup = indexer_group
+
+[tcpout:indexer_group]
+server = <SPLUNK_SERVER_IP>:9997
+useACK = true
+```
+
+The supplied `Configs/inputs.conf` collects these Windows channels:
+
+- Application
+- Security
+- System
+- Windows Firewall
+- Microsoft-Windows-Sysmon/Operational
+
+Windows event channels are assigned to the `wineventlog` index. Sysmon Operational events are assigned to the `sysmon` index.
+
+**Environment-specific values:** the current sample `inputs.conf` uses the host value `CAITLIN`, and `outputs.conf` contains the lab's original destination address. Change these values before reusing the files on another machine. The `UF.ps1` script also currently contains the lab destination address directly in its here-string; update that `server` line before running the script in a different network.
+
+Run the PowerShell script from an elevated PowerShell window on the Windows endpoint after reviewing its contents:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\UF.ps1
+```
+
+The script writes the configuration files under:
+
+```text
+C:\Program Files\SplunkUniversalForwarder\etc\system\local\
+```
+
+It then restarts the Universal Forwarder service and sets the service startup type to Automatic.
+
+### 1.3 Verify the forwarder
+
+Check the Windows service:
+
+```powershell
+Get-Service SplunkForwarder
+```
+
+Check configured forwarding destinations:
+
+```powershell
+& "C:\Program Files\SplunkUniversalForwarder\bin\splunk.exe" list forward-server
+```
+
+The expected outcome is a running service and the Splunk receiver listed as an active forward.
+
+## 2. Linux syslog forwarding
+
+The Ubuntu endpoint uses rsyslog to forward syslog messages to the Splunk UDP input.
+
+The Splunk UDP input used in this lab is:
+
+| Setting | Value |
+| --- | --- |
+| Protocol | UDP |
+| Port | `1514` |
+| Source type | `syslog` |
+| Index | `main` |
+
+The rsyslog forwarding rule used for a local Splunk listener is:
+
+```bash
+*.* @127.0.0.1:1514
+```
+
+In rsyslog syntax, `@` selects UDP forwarding; `@@` selects TCP forwarding. The forwarding rule should be saved in a file under `/etc/rsyslog.d/` and rsyslog restarted after configuration.
+
+Generate a test event:
+
+```bash
+logger "CySA+ lab test: rsyslog to Splunk via UDP 1514"
+```
+
+The Linux forwarding configuration file itself is not included in this repository, so the command above documents the forwarding directive used rather than providing a ready-to-install rsyslog configuration file.
+
+## 3. SPL investigation searches
+
+### 3.1 Check event volume by index and host
+
+```spl
+index=*
+| stats count by index host
+```
+
+**Purpose:** Get a quick overview of which indexes and hosts are returning events.
+
+### 3.2 Find the Linux test message
+
+```spl
+index=main "CySA+ lab test"
+```
+
+**Purpose:** Confirm that the generated Linux test message reached Splunk. The screenshot evidence in this lab shows the test message returned from `main`.
+
+### 3.3 Find Notepad and Calculator activity
+
+```spl
+index=sysmon (process_exec=notepad.exe OR process_exec=calc.exe)
+| table _time EventID EventDescription host process_name
+```
+
+**Purpose:** Find the Notepad and Calculator activity generated on Windows.
+
+The fields `process_exec`, `EventDescription` and `process_name` depend on the event parsing and field extractions available in the Splunk environment. If this search returns no results, inspect a raw event first and adapt the field names. A more general starting point is:
+
+```spl
+index=sysmon ("notepad.exe" OR "calc.exe")
+| table _time host sourcetype EventCode EventID Image CommandLine
+| sort 0 -_time
+```
+
+## 4. Evidence
+
+The `Screenshots/` folder contains the following evidence:
+
+- `UDP 1514 Data Input in Splunk.png` – Splunk UDP input configuration.
+- `log ingestion from Linux.png` and `log ingestion from Linux 24 hours.png` – Linux test-message search results over different time ranges.
+- `Logs being ingested.png` – event counts by index and host.
+- `Searching for the activity in Splunk.png` – Windows process activity investigation.
+
+These screenshots document the lab results at the time they were captured. Re-run the searches if validating the setup in a new environment.
+
+## 5. Verification and limitations
+
+The supplied evidence demonstrates:
+
+- A Splunk UDP input configured for port `1514`.
+- A Linux test message returned by a search in `main`.
+- Windows/Sysmon events returned by searches in Splunk.
+- Event volume across the indexes shown in the screenshots.
+
+The repository does not currently include the Linux rsyslog forwarding configuration file, and the Windows forwarder files contain lab-specific settings. Add a sanitised rsyslog configuration and replace environment-specific values with clearly labelled placeholders before treating this folder as a fully reusable setup package.
+
+## 6. Skills demonstrated
+
+- Splunk Enterprise data-input configuration
+- Splunk Universal Forwarder setup
+- Windows Event Log and Sysmon collection
+- rsyslog-based Linux log forwarding
+- TCP and UDP connectivity checks
+- Index and host verification
+- SPL searching and basic event investigation
+
+---
+
+**Lab:** 01 – SIEM Log Ingestion  
+**Focus:** Centralised Windows and Linux telemetry with Splunk Enterprise
