@@ -1,0 +1,286 @@
+# Lab 2 – Operating System (OS) Concepts
+
+## Overview
+
+This lab explores how operating-system activity can be monitored, collected and analysed using Splunk.
+
+The practical exercises focus on Windows security auditing, registry modifications, process-creation monitoring and Linux file-integrity monitoring using auditd. The objective is to understand how normal operating-system activity generates security events and how those events can help an analyst recognise and investigate potentially suspicious behaviour.
+
+**Certification alignment:** CompTIA CySA+ – Objective 1.1
+
+## Lab environment
+
+| Component | Technology |
+| --- | --- |
+| Windows endpoint | Windows 11 |
+| Linux endpoint | Ubuntu |
+| SIEM | Splunk Enterprise |
+| Log collection | Splunk Universal Forwarder |
+| Windows monitoring | Windows Audit Policy and Sysmon |
+| Linux monitoring | auditd |
+| Virtualisation | Oracle VirtualBox |
+
+## Learning objectives
+
+- Configure Windows security audit policies.
+- Monitor Windows registry modifications associated with persistence.
+- Generate and investigate process-creation events.
+- Understand Windows Security Event IDs 4688 and 4719.
+- Monitor important Linux configuration files using auditd.
+- Investigate file-modification events.
+- Search and analyse security events using Splunk SPL.
+- Understand how operating-system activity can provide evidence of suspicious behaviour.
+
+## Repository contents
+
+| Path | Purpose |
+| --- | --- |
+| `Scripts/OSConcepts.ps1` | Enables selected Windows audit subcategories, process-creation command-line logging and time synchronisation |
+| `Scripts/01_generate_events.ps1` | Creates a test Run-key entry, modifies a test registry value and launches benign test processes |
+| `Scripts/02_linux_audit_setup.sh` | Installs auditd, writes the SSH configuration watch rule and reloads audit rules |
+| `Configs/sshd.rules` | Contains the backup, SSH configuration modification and SSH service restart commands used to generate a file-change event; despite its filename, this file is not the audit rule itself |
+| `Queries/os-concepts-queries.spl` | Contains the registry monitoring SPL search |
+| `Screenshots/` | Evidence of Windows audit policy, registry and process monitoring, and Linux auditd activity |
+
+## 1. Windows 11 – Security auditing
+
+### 1.1 Configure audit policies
+
+Run `Scripts/OSConcepts.ps1` from PowerShell as Administrator. The script enables selected audit subcategories, including:
+
+- Process Creation
+- Registry
+- Security System Extension
+- System Integrity
+- MPSSVC Rule-Level Policy Change
+- Filtering Platform Policy Change
+- Other Policy Change Events
+- Other System Events
+
+It also enables process-creation command-line logging through the registry value:
+
+```text
+HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit
+ProcessCreationIncludeCmdLine_Enabled = 1 (REG_DWORD)
+```
+
+The script configures Windows Time according to whether the machine is domain-joined, enables the time service and requests a time resynchronisation. Correct time is useful when correlating endpoint events with SIEM events.
+
+Audit subcategory names can vary with Windows language and version. Review the script output and verify the resulting policy settings on the actual endpoint.
+
+### 1.2 Relevant Windows Security Event IDs
+
+| Event ID | Description | Investigation value |
+| --- | --- | --- |
+| 4688 | A new process has been created | Process execution and, when enabled and populated, command-line investigation |
+| 4719 | System audit policy was changed | Detecting changes to security auditing |
+| 1102 | The Security audit log was cleared | Potential evidence of log tampering |
+| 4732 | A member was added to a security-enabled local group | Monitoring local group membership changes |
+
+These event IDs are investigation leads. Their presence or absence should be interpreted in context, and the relevant audit subcategory must be enabled for the event to be generated.
+
+### 1.3 Registry persistence monitoring
+
+The event-generation script creates a harmless test Run-key value:
+
+```text
+HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+Value name: CySA_Benign
+Value data: notepad.exe
+```
+
+A value under this Run key can cause the configured application to start when the user logs in. In this lab, Notepad is used as a harmless demonstration payload.
+
+The script also creates `HKCU\Software\CySA`, changes and removes a test value, and launches Notepad, Calculator and a benign PowerShell command.
+
+Relevant Sysmon event IDs:
+
+- **12:** Registry object create/delete.
+- **13:** Registry value set.
+- **14:** Registry object rename.
+
+### 1.4 Generate the Windows test events
+
+Review and run `Scripts/01_generate_events.ps1` in the Windows test VM. The script writes to the current user's registry and starts benign test processes. It is intended for a lab account and should not be run on a production endpoint.
+
+## 2. Linux – File-integrity monitoring with auditd
+
+### 2.1 Install auditd and add the watch rule
+
+Run `Scripts/02_linux_audit_setup.sh` on the Ubuntu test VM. It installs auditd and writes this rule to `/etc/audit/rules.d/sshd.rules`:
+
+```text
+-w /etc/ssh/sshd_config -p wa -k sshd_config_change
+```
+
+The rule watches `/etc/ssh/sshd_config` for writes (`w`) and attribute changes (`a`). The key `sshd_config_change` makes related records easier to find.
+
+After loading the rules, verify that the rule is active:
+
+```bash
+sudo auditctl -l
+```
+
+The output should include a watch on `/etc/ssh/sshd_config` with the key `sshd_config_change`. If the rule does not appear, do not assume monitoring is active; check the auditd service and rule-loading output before proceeding.
+
+### 2.2 Generate a file-change event
+
+The commands in `Configs/sshd.rules` perform the test change:
+
+```bash
+sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sudo systemctl restart ssh
+```
+
+The original SSH configuration is backed up before the edit. The `sed` command changes an existing `PasswordAuthentication` line; if the directive is absent or formatted differently, verify the file manually to confirm the intended change occurred.
+
+**Important:** changing SSH authentication settings and restarting SSH can affect remote access. Perform this in a disposable test VM with console access or an alternative login method. Do not rely on an SSH session as your only way back into the machine.
+
+### 2.3 Verify local audit records
+
+Use the audit key to inspect local records:
+
+```bash
+sudo ausearch -k sshd_config_change -i
+```
+
+Look for records associated with `/etc/ssh/sshd_config`, including relevant `SYSCALL` and `PATH` records. The evidence should identify the file and the process responsible for the modification.
+
+Local auditd evidence proves that the Linux endpoint recorded the activity. It does not, by itself, prove that Splunk received and indexed those records.
+
+## 3. Splunk – Security event analysis
+
+The following searches are investigation examples for the events generated in this lab. Field availability depends on the event format, Universal Forwarder inputs, add-ons and field extractions in the Splunk environment.
+
+### 3.1 Registry modifications
+
+```spl
+index=sysmon (EventCode=13 OR EventCode=12 OR EventCode=14)
+| where like(TargetObject, "%\\Software\\Microsoft\\Windows\\CurrentVersion\\Run%")
+| table _time Computer User EventCode TargetObject Details
+| sort 0 -_time
+```
+
+**Purpose:** Identify Sysmon registry activity involving Windows Run keys.
+
+### 3.2 Process creation – Windows Security
+
+```spl
+index=wineventlog EventCode=4688
+| table _time Computer Account_Name New_Process_Name CommandLine Parent_Process_Name
+| sort 0 -_time
+```
+
+**Purpose:** Investigate newly created processes from Windows Security auditing. Field names may differ depending on XML parsing and add-on configuration. Inspect a raw event if a displayed field is empty.
+
+### 3.3 Process creation – Sysmon
+
+```spl
+index=sysmon EventCode=1
+| table _time Computer User Image CommandLine ParentImage
+| sort 0 -_time
+```
+
+**Purpose:** Investigate process creation using Sysmon Event ID 1, including image, command line and parent image where those fields are extracted.
+
+### 3.4 Commonly investigated command-line utilities
+
+```spl
+(index=wineventlog EventCode=4688) OR (index=sysmon EventCode=1)
+| eval cmd=coalesce(CommandLine,ProcessCommandLine)
+| where match(lower(cmd), "(powershell|mshta|rundll32|regsvr32)")
+| table _time Computer Account_Name User New_Process_Name Image cmd Parent_Process_Name ParentImage
+| sort 0 -_time
+```
+
+**Purpose:** Highlight command lines containing commonly investigated Windows utilities. These utilities are not inherently malicious. Their presence is an investigation lead, not proof of compromise.
+
+### 3.5 Security audit policy and group changes
+
+```spl
+index=wineventlog (EventCode=4719 OR EventCode=1102 OR EventCode=4739 OR EventCode=4732 OR EventCode=4735)
+| table _time Computer EventCode TaskCategory Message
+| sort 0 -_time
+```
+
+**Purpose:** Investigate changes to security policies, audit logging and group membership. Confirm that the relevant events are being collected and that the field names match the data in the index.
+
+### 3.6 Linux SSH configuration monitoring
+
+```spl
+index=main sshd_config_change
+| table _time host sourcetype source _raw
+| sort 0 -_time
+```
+
+**Purpose:** Find records containing the audit key in the selected index. This is a discovery search; refine it after inspecting the actual audit event structure. Confirm that the results contain auditd `SYSCALL` and `PATH` records identifying `/etc/ssh/sshd_config`, rather than merely shell or syslog messages mentioning the key.
+
+The current `Queries/os-concepts-queries.spl` file contains the registry-monitoring search (section 3.1). The other searches above are documented here as additional investigation examples; they have not all been added to the `.spl` file yet.
+
+## 4. Evidence and screenshots
+
+The `Screenshots/` folder groups evidence from the exercises:
+
+| Screenshot | What it is intended to demonstrate |
+| --- | --- |
+| `windows-audit-policy-part-1.png` and `windows-audit-policy-part-2.png` | Windows audit-policy configuration |
+| `audit-policy-system changes.png` and `audit-policy-system changes-part-2.png` | Security audit policy/system-change event investigation |
+| `Registry-change (persistence keys) #U2014 Sysmon.png` | Sysmon registry activity around the test Run key |
+| `process-creation.png` and `Process-creation-with-command-line #U2014 Security or Sysmon.png` | Windows process-creation monitoring |
+| `sysmon-event-01.png` | Sysmon process creation events |
+| `powershell-mshta-rundll32-regsvr32-flags.png` | Search results involving commonly investigated utilities |
+| `parent-process-name-notepad.png` | Parent-process investigation example; inspect the returned fields carefully because the captured result does not clearly populate the parent-process value |
+| `linux-auditd-part-1.png`, `linux-auditd-part-2.png` and `linux-auditd-part-3.png` | Linux auditd setup and local audit investigation |
+| `Linux-sshd_config-FIM-event.png` | Splunk search associated with the SSH configuration audit key; confirm the returned records are actual file audit events before treating it as proof of Splunk FIM ingestion |
+
+Screenshots show the state at capture time. Repeat the relevant checks when validating the lab in another environment.
+
+## 5. Cleanup and rollback
+
+### Windows
+
+Remove the test Run-key entry and temporary registry key:
+
+```powershell
+Remove-ItemProperty -Path HKCU:\Software\Microsoft\Windows\CurrentVersion\Run -Name "CySA_Benign" -ErrorAction SilentlyContinue
+Remove-Item -Path HKCU:\Software\CySA -Recurse -Force -ErrorAction SilentlyContinue
+```
+
+### Ubuntu
+
+Restore the SSH configuration backup created before the test:
+
+```bash
+sudo mv /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+sudo systemctl restart ssh
+```
+
+After cleanup, verify that the restored SSH configuration is correct and that the audit rule is still present only if you intend to continue monitoring the file. Remove the test audit rule when the lab is finished if you no longer need it.
+
+## 6. Completion and verification status
+
+The supplied screenshots demonstrate Windows audit-policy configuration, Windows process-creation events, Sysmon process events, registry monitoring and Linux auditd activity.
+
+Two verification points still deserve attention before describing every objective as fully complete:
+
+1. The Windows Security Event ID 4688 screenshot does not clearly show a populated command-line field, even though Sysmon process events show command-line information. Verify the Windows 4688 details after enabling command-line auditing.
+2. The Linux screenshots establish local auditd setup/activity, but the Splunk search screenshot does not conclusively prove that actual `PATH`/`SYSCALL` records for `/etc/ssh/sshd_config` reached Splunk. Verify with `auditctl -l`, `ausearch -k sshd_config_change -i` and a Splunk search that returns those actual records.
+
+Do not mark those two items complete until the corresponding event fields and Splunk records have been checked.
+
+## Skills demonstrated
+
+- Windows security audit policy configuration
+- Windows process-creation monitoring
+- Sysmon event investigation
+- Registry persistence monitoring
+- Linux auditd rule configuration
+- File-integrity monitoring concepts
+- SPL searching and event triage
+- Safe test-event generation and rollback
+
+---
+
+**Lab:** 02 – Operating System (OS) Concepts  
+**Certification alignment:** CompTIA CySA+ – Objective 1.1
